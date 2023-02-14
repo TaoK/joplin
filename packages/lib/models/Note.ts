@@ -829,6 +829,146 @@ export default class Note extends BaseItem {
 		}), { autoTimestamp: false, dispatchUpdateAction: false });
 	}
 
+	// Get the id, sort order values, and sequence of visible notes in a
+	// folder.
+	static async getVisibleNoteList_(folderId: string, showCompletedTodos: boolean, uncompletedTodosOnTop: boolean) {
+		const noteSql = `
+			SELECT id, \`order\`, user_created_time, user_updated_time,
+				is_todo, todo_completed, title
+			FROM notes
+			WHERE
+				is_conflict = 0
+				${showCompletedTodos ? '' : 'AND todo_completed = 0'}
+			AND parent_id = ?
+		`;
+		const notes_raw: NoteEntity[] = await this.modelSelectAll(noteSql, [folderId]);
+		return await this.sortNotes(notes_raw, this.customOrderByColumns(), uncompletedTodosOnTop);
+	}
+
+	static isNoteUncompleted(n: NoteEntity) {
+		return !(n.todo_completed || !n.is_todo);
+	}
+
+	static async shiftSameOrderNotes_(notesToShift: NoteEntity[], defaultIntevalBetweeNotes: number) {
+		const indexToShift = notesToShift.length - 1;
+		let previousOrder = notesToShift[indexToShift].order;
+		for (let i = indexToShift; i >= 0; i--) {
+			const n = notesToShift[i];
+			if (n.order <= previousOrder) {
+				const o = previousOrder + defaultIntevalBetweeNotes;
+				const updatedNote = await this.updateNoteOrder_(n, o);
+				notesToShift[i] = Object.assign({}, n, updatedNote);
+				previousOrder = o;
+			} else {
+				previousOrder = n.order;
+			}
+		}
+		return notesToShift[indexToShift];
+	}
+
+	// Get the initial sort order value and interval to insert one or more
+	// notes at a given positional index in a display list. This may shift
+	// notes with the exact same order, if necessary to allow insert between
+	// them.
+	static async getNewNoteOrder_(notes: NoteEntity[], target_index: number, insertCount: number, uncompletedTodosOnTop: boolean, targetUncompleted: boolean) {
+		// If uncompletedTodosOnTop, then we should only consider the existing
+		// order of same-completion-window notes. A completed todo or non-todo
+		// dragged into the uncompleted list should end up at the start of the
+		// completed/non-todo list, and an uncompleted todo dragged into the
+		// completed/non-todo list should end up at the end of the uncompleted
+		// list.
+		// To make this determination we need to know the completion status of the
+		// item we are dropping. We apply several simplifications:
+		//  - We only care about completion status if uncompletedTodosOnTop
+		//  - We only care about completion status / position if the item being
+		//     moved is already in the current list; not if it is dropped from
+		//     another notebook.
+		//  - We only care about the completion status of the first item being
+		//     moved. If a moving selection includes both uncompleted and
+		//     completed/non-todo items, then the completed/non-todo items will
+		//     not get "correct" position (although even defining a "more correct"
+		//     outcome in such a case might be challenging).
+		let relevantExistingNoteCount = notes.length;
+		let firstRelevantNoteIndex = 0;
+		let lastRelevantNoteIndex = notes.length - 1;
+		if (uncompletedTodosOnTop) {
+			const noteFilterCondition = targetUncompleted ? (n: NoteEntity) => this.isNoteUncompleted(n) : (n: NoteEntity) => !this.isNoteUncompleted(n);
+			relevantExistingNoteCount = notes.filter(noteFilterCondition).length;
+			firstRelevantNoteIndex = notes.findIndex(noteFilterCondition);
+			lastRelevantNoteIndex = notes.map(noteFilterCondition).lastIndexOf(true);
+		}
+
+		// Find the order value for the first note to be inserted,
+		// and the increment between the order values of each inserted notes.
+		let newOrder = 0;
+		let intervalBetweenNotes = 0;
+		const defaultIntevalBetweeNotes = 60 * 60 * 1000;
+
+		if (!relevantExistingNoteCount) { // If there's no (relevant) notes in the target notebook
+			newOrder = Date.now();
+			intervalBetweenNotes = defaultIntevalBetweeNotes;
+		} else if (target_index > lastRelevantNoteIndex) { // Insert at the end (of relevant group)
+			intervalBetweenNotes = notes[lastRelevantNoteIndex].order / (insertCount + 1);
+			newOrder = notes[lastRelevantNoteIndex].order - intervalBetweenNotes;
+		} else if (target_index <= firstRelevantNoteIndex) { // Insert at the beginning (of relevant group)
+			const firstNoteOrder = notes[firstRelevantNoteIndex].order;
+			if (firstNoteOrder >= Date.now()) {
+				intervalBetweenNotes = defaultIntevalBetweeNotes;
+				newOrder = firstNoteOrder + defaultIntevalBetweeNotes;
+			} else {
+				intervalBetweenNotes = (Date.now() - firstNoteOrder) / (insertCount + 1);
+				newOrder = firstNoteOrder + intervalBetweenNotes * insertCount;
+			}
+		} else { // Normal insert
+			let noteBefore = notes[target_index - 1];
+			const noteAfter = notes[target_index];
+
+			if (noteBefore.order === noteAfter.order) {
+				// Need to "make space"
+				noteBefore = await this.shiftSameOrderNotes_(notes.slice(0, target_index), defaultIntevalBetweeNotes);
+			}
+
+			intervalBetweenNotes = (noteBefore.order - noteAfter.order) / (insertCount + 1);
+			newOrder = noteAfter.order + intervalBetweenNotes * insertCount;
+		}
+		return { newOrder, intervalBetweenNotes };
+	}
+
+	// If some of the target notes have order = 0, set the order field to user_created_time
+	// (historically, all notes had the order field set to 0)
+	static async setMissingOrders_(notes: NoteEntity[]) {
+
+		let hasSetOrder = false;
+
+		for (let i = 0; i < notes.length; i++) {
+			const note = notes[i];
+			if (!note.order) {
+				const updatedNote = await this.updateNoteOrder_(note, note.user_created_time);
+				notes[i] = updatedNote;
+				hasSetOrder = true;
+			}
+		}
+
+		return hasSetOrder;
+	}
+
+	static async updateInsertedNotes_(noteIds: string[], folderId: string, newOrder: number, intervalBetweenNotes: number) {
+		let nextOrder = newOrder;
+
+		for (const noteId of noteIds) {
+			const note = await Note.load(noteId);
+			if (!note) throw new Error(`No such note: ${noteId}`);
+
+			await this.updateNoteOrder_({
+				id: noteId,
+				parent_id: folderId,
+				user_updated_time: note.user_updated_time,
+			}, nextOrder);
+
+			nextOrder -= intervalBetweenNotes;
+		}
+	}
+
 	// This method will disable the NOTE_UPDATE_ONE action to prevent a lot
 	// of unecessary updates, so it's the caller's responsability to update
 	// the UI once the call is finished. This is done by listening to the
@@ -849,21 +989,7 @@ export default class Note extends BaseItem {
 		});
 
 		try {
-			const getSortedNotes = async (folderId: string) => {
-				const noteSql = `
-					SELECT id, \`order\`, user_created_time, user_updated_time,
-						is_todo, todo_completed, title
-					FROM notes
-					WHERE
-						is_conflict = 0
-						${showCompletedTodos ? '' : 'AND todo_completed = 0'}
-					AND parent_id = ?
-				`;
-				const notes_raw: NoteEntity[] = await this.modelSelectAll(noteSql, [folderId]);
-				return await this.sortNotes(notes_raw, this.customOrderByColumns(), uncompletedTodosOnTop);
-			};
-
-			let notes = await getSortedNotes(folderId);
+			let notes = await this.getVisibleNoteList_(folderId, showCompletedTodos, uncompletedTodosOnTop);
 
 			// If the target index is the same as the source note index, exit now
 			for (let i = 0; i < notes.length; i++) {
@@ -871,112 +997,16 @@ export default class Note extends BaseItem {
 				if (note.id === noteIds[0] && index === i) return defer();
 			}
 
-			// If some of the target notes have order = 0, set the order field to user_created_time
-			// (historically, all notes had the order field set to 0)
-			let hasSetOrder = false;
-			for (let i = 0; i < notes.length; i++) {
-				const note = notes[i];
-				if (!note.order) {
-					const updatedNote = await this.updateNoteOrder_(note, note.user_created_time);
-					notes[i] = updatedNote;
-					hasSetOrder = true;
-				}
-			}
+			const hasSetOrder = await this.setMissingOrders_(notes);
+			if (hasSetOrder) notes = await this.getVisibleNoteList_(folderId, showCompletedTodos, uncompletedTodosOnTop);
 
-			if (hasSetOrder) notes = await getSortedNotes(folderId);
+			const targetNoteInNotebook = notes.find(n => n.id === noteIds[0]);
+			const isTargetUncompleted = targetNoteInNotebook ? this.isNoteUncompleted(targetNoteInNotebook) : false;
+			const newOrderDetails = await this.getNewNoteOrder_(notes, index, noteIds.length, uncompletedTodosOnTop, isTargetUncompleted);
+			const { intervalBetweenNotes } = newOrderDetails;
+			const { newOrder } = newOrderDetails;
 
-			// If uncompletedTodosOnTop, then we should only consider the existing
-			// order of same-completion-window notes. A completed todo or non-todo
-			// dragged into the uncompleted list should end up at the start of the
-			// completed/non-todo list, and an uncompleted todo dragged into the
-			// completed/non-todo list should end up at the end of the uncompleted
-			// list.
-			// To make this determination we need to know the completion status of the
-			// item we are dropping. We apply several simplifications:
-			//  - We only care about completion status if uncompletedTodosOnTop
-			//  - We only care about completion status / position if the item being
-			//     moved is already in the current list; not if it is dropped from
-			//     another notebook.
-			//  - We only care about the completion status of the first item being
-			//     moved. If a moving selection includes both uncompleted and
-			//     completed/non-todo items, then the completed/non-todo items will
-			//     not get "correct" position (although even defining a "more correct"
-			//     outcome in such a case might be challenging).
-			let relevantExistingNoteCount = notes.length;
-			let firstRelevantNoteIndex = 0;
-			let lastRelevantNoteIndex = notes.length - 1;
-			if (uncompletedTodosOnTop) {
-				const uncompletedTest = (n: NoteEntity) => !(n.todo_completed || !n.is_todo);
-				const targetNoteInNotebook = notes.find(n => n.id === noteIds[0]);
-				if (targetNoteInNotebook) {
-					const targetUncompleted = uncompletedTest(targetNoteInNotebook);
-					const noteFilterCondition = targetUncompleted ? (n: NoteEntity) => uncompletedTest(n) : (n: NoteEntity) => !uncompletedTest(n);
-					relevantExistingNoteCount = notes.filter(noteFilterCondition).length;
-					firstRelevantNoteIndex = notes.findIndex(noteFilterCondition);
-					lastRelevantNoteIndex = notes.map(noteFilterCondition).lastIndexOf(true);
-				}
-			}
-
-			// Find the order value for the first note to be inserted,
-			// and the increment between the order values of each inserted notes.
-			let newOrder = 0;
-			let intervalBetweenNotes = 0;
-			const defaultIntevalBetweeNotes = 60 * 60 * 1000;
-
-			if (!relevantExistingNoteCount) { // If there's no (relevant) notes in the target notebook
-				newOrder = Date.now();
-				intervalBetweenNotes = defaultIntevalBetweeNotes;
-			} else if (index > lastRelevantNoteIndex) { // Insert at the end (of relevant group)
-				intervalBetweenNotes = notes[lastRelevantNoteIndex].order / (noteIds.length + 1);
-				newOrder = notes[lastRelevantNoteIndex].order - intervalBetweenNotes;
-			} else if (index <= firstRelevantNoteIndex) { // Insert at the beginning (of relevant group)
-				const firstNoteOrder = notes[firstRelevantNoteIndex].order;
-				if (firstNoteOrder >= Date.now()) {
-					intervalBetweenNotes = defaultIntevalBetweeNotes;
-					newOrder = firstNoteOrder + defaultIntevalBetweeNotes;
-				} else {
-					intervalBetweenNotes = (Date.now() - firstNoteOrder) / (noteIds.length + 1);
-					newOrder = firstNoteOrder + intervalBetweenNotes * noteIds.length;
-				}
-			} else { // Normal insert
-				let noteBefore = notes[index - 1];
-				let noteAfter = notes[index];
-
-				if (noteBefore.order === noteAfter.order) {
-					let previousOrder = noteBefore.order;
-					for (let i = index; i >= 0; i--) {
-						const n = notes[i];
-						if (n.order <= previousOrder) {
-							const o = previousOrder + defaultIntevalBetweeNotes;
-							const updatedNote = await this.updateNoteOrder_(n, o);
-							notes[i] = Object.assign({}, n, updatedNote);
-							previousOrder = o;
-						} else {
-							previousOrder = n.order;
-						}
-					}
-
-					noteBefore = notes[index - 1];
-					noteAfter = notes[index];
-				}
-
-				intervalBetweenNotes = (noteBefore.order - noteAfter.order) / (noteIds.length + 1);
-				newOrder = noteAfter.order + intervalBetweenNotes * noteIds.length;
-			}
-
-			// Set the order value for all the notes to be inserted
-			for (const noteId of noteIds) {
-				const note = await Note.load(noteId);
-				if (!note) throw new Error(`No such note: ${noteId}`);
-
-				await this.updateNoteOrder_({
-					id: noteId,
-					parent_id: folderId,
-					user_updated_time: note.user_updated_time,
-				}, newOrder);
-
-				newOrder -= intervalBetweenNotes;
-			}
+			await this.updateInsertedNotes_(noteIds, folderId, newOrder, intervalBetweenNotes);
 		} finally {
 			defer();
 		}
